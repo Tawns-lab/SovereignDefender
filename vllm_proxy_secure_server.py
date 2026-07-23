@@ -7,7 +7,8 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, Iterable, List
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional
 
 import importlib.util
 
@@ -15,6 +16,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -54,7 +56,86 @@ GPU_MEM_USED = Gauge("vllm_gpu_memory_used_bytes", "GPU memory used bytes", ["gp
 GPU_MEM_TOTAL = Gauge("vllm_gpu_memory_total_bytes", "GPU memory total bytes", ["gpu_index"])
 DEPLOYS = Counter("deploys_total", "Count of deploy events", ["service", "env"])
 
+
+class Pin(BaseModel):
+    id: str
+    x: float
+    y: float
+    selector: str
+    element_html: str
+    screenshot_base64: Optional[str] = None
+    comment: str
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+
+class PinpointFeedback(BaseModel):
+    pins: List[Pin] = Field(default_factory=list)
+    page_url: str
+    page_title: str
+    user_id: str = "default"
+
+
+class PinpointFaculty:
+    """Spatial context and annotation processor for browser feedback."""
+
+    def __init__(self) -> None:
+        self.name = "Pinpoint"
+        self.pin_history: List[Pin] = []
+        self.evidence: List[Dict[str, Any]] = []
+
+    def process_feedback(self, feedback: PinpointFeedback) -> Dict[str, Any]:
+        """Process pinpoint feedback and retain it as structured evidence."""
+        context: Dict[str, Any] = {
+            "page_url": feedback.page_url,
+            "page_title": feedback.page_title,
+            "pin_count": len(feedback.pins),
+            "pin_context": [],
+        }
+
+        for pin in feedback.pins:
+            self.pin_history.append(pin)
+            context["pin_context"].append(
+                {
+                    "id": pin.id,
+                    "element": pin.selector,
+                    "comment": pin.comment,
+                    "position": f"({pin.x}, {pin.y})",
+                }
+            )
+            self.evidence.append(
+                {
+                    "id": f"PIN-{pin.id}",
+                    "statement": pin.comment,
+                    "source": "pinpoint",
+                    "metadata": {
+                        "selector": pin.selector,
+                        "coordinates": {"x": pin.x, "y": pin.y},
+                        "page_url": feedback.page_url,
+                        "page_title": feedback.page_title,
+                        "user_id": feedback.user_id,
+                    },
+                }
+            )
+
+        return {"status": "processed", "pins": len(feedback.pins), "context": context}
+
+    def get_pin_context(self, pin_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve context for a specific pin."""
+        for pin in self.pin_history:
+            if pin.id == pin_id:
+                return pin.dict()
+        return None
+
+    def get_all_pins(self) -> List[Dict[str, Any]]:
+        """Retrieve all pins."""
+        return [pin.dict() for pin in self.pin_history]
+
+    def get_all_evidence(self) -> List[Dict[str, Any]]:
+        """Retrieve all evidence entries created from pins."""
+        return self.evidence
+
 app = FastAPI(title="vLLM proxy + metrics")
+app.state.pinpoint = PinpointFaculty()
 
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -287,6 +368,37 @@ async def internal_deploy(request: Request) -> Dict[str, Any]:
     DEPLOYS.labels(service=service, env=env).inc()
     log_info(request, "Deploy event recorded", service=service, env=env)
     return {"ok": True, "service": service, "env": env}
+
+
+@app.post("/pinpoint/feedback")
+@limiter.limit("60/minute")
+async def handle_pinpoint_feedback(request: Request, feedback: PinpointFeedback) -> Dict[str, Any]:
+    """Receive spatial annotation feedback from a Pinpoint browser tool."""
+    return app.state.pinpoint.process_feedback(feedback)
+
+
+@app.get("/pinpoint/pins")
+@limiter.limit("60/minute")
+async def get_all_pins(request: Request) -> Dict[str, Any]:
+    """Get all Pinpoint pins retained by this process."""
+    return {"pins": app.state.pinpoint.get_all_pins()}
+
+
+@app.get("/pinpoint/pins/{pin_id}")
+@limiter.limit("60/minute")
+async def get_pin(pin_id: str, request: Request) -> Dict[str, Any]:
+    """Get one Pinpoint pin by ID."""
+    pin = app.state.pinpoint.get_pin_context(pin_id)
+    if pin is None:
+        raise HTTPException(status_code=404, detail="pin not found")
+    return {"pin": pin}
+
+
+@app.get("/pinpoint/evidence")
+@limiter.limit("60/minute")
+async def get_pinpoint_evidence(request: Request) -> Dict[str, Any]:
+    """Get evidence entries generated from Pinpoint annotations."""
+    return {"evidence": app.state.pinpoint.get_all_evidence()}
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
